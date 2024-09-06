@@ -34,6 +34,7 @@ int main()
     smart_cpu_buffer<float> input(net.input_size());
     smart_cpu_buffer<float> ground_truth_and_target_change(net.output_size());
 
+    // Example test: finding coefficients of approximating polynomial.
     for (int i = 0; i < 100; i++)
     {
         float loss = 0.f;
