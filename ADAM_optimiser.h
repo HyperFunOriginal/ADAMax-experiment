@@ -229,13 +229,17 @@ struct neural_net
 		evaluate();
 	}
 
-	neural_net(const std::vector<uint>& node_count, rng_state& state)
+	neural_net(const std::vector<uint>& node_count, rng_state& state, bool init_random = true)
 	{
+		assert(node_count.size() == (hidden_layers + 2u));
 		for (int i = 0; i < hidden_layers + 1u; i++)
 		{
 			hidden_values[i] = smart_gpu_buffer<float>(node_count[i]);
 			hidden[i] = hidden_layer(node_count[i], node_count[i + 1u]);
-			hidden[i].generate_random(state);
+			if (init_random)
+				hidden[i].generate_random(state);
+			else 
+				hidden[i].blank_slate();
 		}
 		output = smart_gpu_cpu_buffer<float>(node_count[hidden_layers + 1u]);
 	}
@@ -271,7 +275,7 @@ __global__ void backpropagation(float* weight_grad, float* bias_grad, float* nod
 __global__ void apply_adaMax_single_layer(const float* weight_grad, const float* bias_grad,
 										float* weight_max, float* bias_max, 
 										float* weight_momentum, float* bias_momentum, 
-										float* weight, float* bias, 
+										float* weight, float* bias, const float l1_regularization,
 										const float momentum, const float adaptive_decay_rate, const float learn_rate,
 										const uint curr_size, const uint next_size)
 {
@@ -298,7 +302,7 @@ __global__ void apply_adaMax_single_layer(const float* weight_grad, const float*
 
 	weight_momentum[idx] = weight_mom;
 	weight_max[idx] = weight_max_temp;
-	weight[idx] = isnan(weight_fin) ? rsqrtf(curr_size) : weight_fin; // synapse dies and is replaced ifnan
+	weight[idx] = isnan(weight_fin) ? rsqrtf(curr_size) : weight_fin - sign(weight_fin) * fminf(l1_regularization, fabsf(weight_fin)); // synapse dies and is replaced ifnan
 }
 
 template <uint hidden_layers>
@@ -325,7 +329,7 @@ private:
 		backpropagation<<<blocks,threads>>>(weight_grad.gpu_buffer_ptr, bias_grad.gpu_buffer_ptr, node_grad.gpu_buffer_ptr, next_node_grad.gpu_buffer_ptr,
 			weight.gpu_buffer_ptr, curr_node.gpu_buffer_ptr, next_node.gpu_buffer_ptr, curr_node.dedicated_len, next_node.dedicated_len);
 	}
-	void apply_adaMax_layer(const uint layer, const float momentum, const float adaptive_decay_rate, const float learn_rate)
+	void apply_adaMax_layer(const uint layer, const float momentum, const float adaptive_decay_rate, const float learn_rate, const float regularization)
 	{
 		uint size = weight_max[layer].dedicated_len;
 		dim3 threads(size < 256u ? size : 256u);
@@ -333,7 +337,7 @@ private:
 		
 		apply_adaMax_single_layer<<<blocks, threads>>>(weight_grad[layer], bias_grad[layer],
 			weight_max[layer], bias_max[layer], weight_momentum[layer], bias_momentum[layer],
-			model.hidden[layer].weight, model.hidden[layer].bias, momentum, adaptive_decay_rate, learn_rate,
+			model.hidden[layer].weight, model.hidden[layer].bias, regularization, momentum, adaptive_decay_rate, learn_rate,
 			model.hidden[layer].old_layer_size, model.hidden[layer].new_layer_size);
 	}
 
@@ -357,11 +361,11 @@ public:
 	/// <param name="momentum">Momentum serving to smooth and regulate changes.</param>
 	/// <param name="adaptive_decay_rate">Decay rate for learning rate correction.</param>
 	/// <param name="learn_rate">Rate at which changes are applied.</param>
-	void apply_adaMax(smart_cpu_buffer<float>& target_change, const float momentum, const float adaptive_decay_rate, const float learn_rate)
+	void apply_adaMax(smart_cpu_buffer<float>& target_change, const float momentum, const float adaptive_decay_rate, const float learn_rate, const float l1_regularization_strength)
 	{
 		backpropagation_full(target_change);
 		for (uint i = 0; i < hidden_layers + 1u; i++)
-			apply_adaMax_layer(i, momentum, adaptive_decay_rate, learn_rate);
+			apply_adaMax_layer(i, momentum, adaptive_decay_rate, learn_rate, l1_regularization_strength);
 	}
 	ADAMax(neural_net<hidden_layers>& model) : model(model)
 	{
@@ -383,5 +387,60 @@ public:
 		}
 	}
 };
+
+// Untested, experimental
+
+template <uint hidden_layers>
+static int sample_gibbs_dist(neural_net< hidden_layers>& model, smart_cpu_buffer<float>& inout, rng_state& state)
+{
+	model.evaluate_with_ext_input(inout);
+
+	float t = 1.f;
+	for (uint j = 0; j < model.output.dedicated_len; j++)
+	{
+		float s = expf(model.output[j]);
+		inout[j] = s; t += s;
+	}
+	for (uint j = 0; j < model.output.dedicated_len; j++)
+		inout[j] /= t;
+
+	t = (state.gen_float() * .5f + .5f) - (1.f / t);
+	for (uint j = 0; j < model.output.dedicated_len; j++)
+	{
+		if (t < 0.f) { return j; }
+		t -= inout[j];
+	}
+	return model.output.dedicated_len;
+}
+
+template <uint hidden_layers>
+static void optimise_reinforcement_learning(ADAMax<hidden_layers>& optimiser, std::vector<float>& reinforce_in, std::vector<float>& discourage_in, smart_cpu_buffer<float>& temp,
+											const float momentum, const float adaptive_decay_rate, const float learn_rate, const float regularization, const float action_weight, rng_state& state)
+{
+	const uint in_size = optimiser.model.hidden_values[0].dedicated_len;
+	const uint out_size = optimiser.model.output.dedicated_len;
+	assert(reinforce_in.size() % in_size == 0 && discourage_in.size() % in_size == 0 && temp.dedicated_len == in_size);
+	for (uint i = 0, s = reinforce_in.size() / in_size; i < s; i++)
+	{
+		for (uint j = 0; j < in_size; j++)
+			temp[j] = reinforce_in[i * in_size + j];
+
+		uint sample = sample_gibbs_dist<hidden_layers>(optimiser.model, temp, state);
+		for (uint j = 0; j < out_size; j++)
+			temp[j] = lerp((j + 1u == sample) ? 1.f : -1.f / out_size, temp[j] - 1.f / (out_size + 1.f), action_weight);
+		optimiser.apply_adaMax(temp, momentum, 0.f, 0.f, 0.f);
+	}
+	for (uint i = 0, s = discourage_in.size() / in_size; i < s; i++)
+	{
+		for (uint j = 0; j < in_size; j++)
+			temp[j] = discourage_in[i * in_size + j];
+		optimiser.model.evaluate_with_ext_input(temp);
+
+		uint sample = sample_gibbs_dist<hidden_layers>(optimiser.model, temp, state);
+		for (uint j = 0; j < out_size; j++)
+			temp[j] = lerp((j + 1u == sample) ? -1.f : 1.f / out_size, 1.f / (out_size + 1.f) - temp[j], action_weight);
+		optimiser.apply_adaMax(temp, momentum, (i + 1u == s) ? adaptive_decay_rate : 0.f, (i + 1u == s) ? learn_rate : 0.f, (i + 1u == s) ? regularization : 0.f);
+	}
+}
 
 #endif

@@ -5,7 +5,9 @@
 #include <vector>
 #include <chrono>
 
-void generate_polynomial(const smart_cpu_buffer<float>& coefficients, smart_cpu_buffer<float>& output)
+constexpr uint epoch_size = 500u;
+
+void generate_noisy_polynomial(const smart_cpu_buffer<float>& coefficients, smart_cpu_buffer<float>& output, rng_state& state)
 {
     for (int i = 0; i < output.dedicated_len; i++)
     {
@@ -15,7 +17,7 @@ void generate_polynomial(const smart_cpu_buffer<float>& coefficients, smart_cpu_
             sum += x * coefficients[j];
             x *= i / (float)output.dedicated_len * 3.f - 1.5f;
         }
-        output[i] = sum;
+        output[i] = sum + state.gen_float() * .25f;
     }
 }
 
@@ -35,23 +37,31 @@ int main()
     smart_cpu_buffer<float> ground_truth_and_target_change(net.output_size());
 
     // Example test: finding coefficients of approximating polynomial.
-    for (int i = 0; i < 100; i++)
+    for (uint i = 0; i < 50; i++)
     {
-        float loss = 0.f;
-        for (int j = 0; j < 200; j++)
+        float loss = 0.f; float f = 1.f - .5f / (i + 10);
+        for (uint j = 0; j < epoch_size; j++)
         {
             for (int k = 0; k < ground_truth_and_target_change.dedicated_len; k++)
                 ground_truth_and_target_change[k] = state.gen_float(i * 1000 + j * 10 + k);
-            generate_polynomial(ground_truth_and_target_change, input);
+            generate_noisy_polynomial(ground_truth_and_target_change, input, state);
             net.evaluate_with_ext_input(input);
+
+            if (j + 1u == epoch_size)
+            {
+                writeline("Sample:\nGround Truth: " + print_buffer(ground_truth_and_target_change));
+                writeline("Prediction: " + print_buffer(net.output));
+            }
+
             for (int k = 0; k < ground_truth_and_target_change.dedicated_len; k++)
             {
                 ground_truth_and_target_change[k] -= net.output[k];
                 loss += ground_truth_and_target_change[k] * ground_truth_and_target_change[k];
             }
-            optimiser.apply_adaMax(ground_truth_and_target_change, 0.98f, 0.98f, 0.001f);
+            optimiser.apply_adaMax(ground_truth_and_target_change, f, f, 0.0015f, 1E-5f);
         }
-        writeline_t(loss * .005f);
+        writeline("Average Loss: " + std::to_string(loss / epoch_size) + "\n");
+        _sleep(1000);
     }
 
     while (true)
