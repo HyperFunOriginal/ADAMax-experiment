@@ -428,7 +428,7 @@ static void optimise_reinforcement_learning(ADAMax<hidden_layers>& optimiser, st
 		uint sample = sample_gibbs_dist<hidden_layers>(optimiser.model, temp, state);
 		for (uint j = 0; j < out_size; j++)
 			temp[j] = lerp((j + 1u == sample) ? 1.f : -1.f / out_size, temp[j] - 1.f / (out_size + 1.f), action_weight);
-		optimiser.apply_adaMax(temp, momentum, 0.f, 0.f, 0.f);
+		optimiser.apply_adaMax(temp, momentum, adaptive_decay_rate, learn_rate, 0.f);
 	}
 	for (uint i = 0, s = discourage_in.size() / in_size; i < s; i++)
 	{
@@ -439,7 +439,7 @@ static void optimise_reinforcement_learning(ADAMax<hidden_layers>& optimiser, st
 		uint sample = sample_gibbs_dist<hidden_layers>(optimiser.model, temp, state);
 		for (uint j = 0; j < out_size; j++)
 			temp[j] = lerp((j + 1u == sample) ? -1.f : 1.f / out_size, 1.f / (out_size + 1.f) - temp[j], action_weight);
-		optimiser.apply_adaMax(temp, momentum, (i + 1u == s) ? adaptive_decay_rate : 0.f, (i + 1u == s) ? learn_rate : 0.f, (i + 1u == s) ? regularization : 0.f);
+		optimiser.apply_adaMax(temp, momentum, adaptive_decay_rate, learn_rate, (i + 1u == s) ? regularization : 0.f);
 	}
 }
 
