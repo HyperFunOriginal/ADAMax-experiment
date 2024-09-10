@@ -434,7 +434,6 @@ static void optimise_reinforcement_learning(ADAMax<hidden_layers>& optimiser, st
 	{
 		for (uint j = 0; j < in_size; j++)
 			temp[j] = discourage_in[i * in_size + j];
-		optimiser.model.evaluate_with_ext_input(temp);
 
 		uint sample = sample_gibbs_dist<hidden_layers>(optimiser.model, temp, state);
 		for (uint j = 0; j < out_size; j++)
